@@ -1,20 +1,20 @@
 // ============================================================
-// JJK 24FRAMES — Sandbox Multiplayer Server (v11)
+// JJK 24FRAMES — Sandbox Multiplayer Server (v12)
 // ============================================================
 // Pivote: SANDBOX puro (estilo Garry's Mod). Sin combate PvP.
 //
-// Cambios principales vs v10:
-// 1. ✅ AUTO-REGISTER props desconocidos: cuando llega propGrab/Update/Scale/Freeze
-//    de un mpId que no está en room.props, se crea automáticamente.
-//    Esto arregla los GLBs externos (toxsam/polyhaven) que se spawneaban vía
-//    voxelChange/toxsamSpawn pero no por propSpawn → no eran "controlables".
-// 2. ✅ SANDBOX MODE sin ownership check estricto:
-//    - Cualquier player puede agarrar/escalar/freezear cualquier prop.
-//    - "Robo" de props funciona estilo Gmod (último que lo agarra gana).
-//    - Esto permite manipulación cooperativa (varios players moviendo cosas).
-// 3. ✅ propUpdate sin ownership check: actualiza posición de cualquier prop,
-//    último escritor gana. Necesario para que cuando otro player agarra TU
-//    prop, vos veas el movimiento de él.
+// Cambios principales vs v11:
+// 1. ✅ AUTO-LIMPIEZA al quedar sala vacía: cuando todos los players salen de
+//    una sala (incluso pinned como "flat"), se borran TODOS los GLBs spawneados,
+//    voxelChanges, props, ragdolls y dummies. Solo se conserva customMapId.
+//    Esto evita los "zombies" de sesiones pasadas que aparecían sin owner.
+// 2. ✅ Endpoint HTTP /clear-room/:id para limpiar manualmente una sala sin
+//    tener que esperar a que se vacíe. Uso: GET /clear-room/flat
+//
+// Cambios v11 (heredados):
+//   - AUTO-REGISTER props desconocidos en propGrab/Update/Scale/Freeze
+//   - SANDBOX MODE sin ownership check (cualquiera puede manipular)
+//   - propUpdate sin filtro de owner
 //
 // Cambios v10 (heredados):
 //   - pose como OBJETO con rotaciones reales
@@ -22,7 +22,7 @@
 //   - emote, dummies, skin, chat handlers
 //   - playerName/color en joinRoom
 //
-// Compatibilidad: 100% backwards con clientes v9/v10.
+// Compatibilidad: 100% backwards con clientes v9/v10/v11.
 // ============================================================
 
 const WebSocket = require('ws');
@@ -196,7 +196,7 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({
       status: 'ok',
       mode: 'sandbox',
-      version: 'v11',
+      version: 'v12',
       players: players.size,
       rooms: rooms.size,
       uptime: Math.round(process.uptime()),
@@ -212,15 +212,44 @@ const server = http.createServer((req, res) => {
         id: r.id, name: r.name, jp: r.jp,
         isPinned: r.isPinned, isPublic: r.isPublic,
         hasPassword: !!r.passwordHash,
-        // ⭐ v10: mandamos AMBOS nombres por compatibilidad con cualquier cliente
-        players: r.players.size,        // numérico para compat con cliente nuevo
-        playersCount: r.players.size,   // por compat con cliente v6
+        players: r.players.size,
+        playersCount: r.players.size,
         maxPlayers: r.maxPlayers,
         voxelChanges: (r.voxelChanges || []).length,
         voxelProps: (r.voxelProps || new Map()).size,
       });
     }
     res.end(JSON.stringify(list));
+    return;
+  }
+  // ⭐ v12: endpoint para limpiar una sala manualmente (forzar reset de GLBs)
+  // Uso: GET /clear-room/flat → limpia voxelChanges, voxelProps, props
+  // Si hay players, los desconecta para que reentren en estado limpio.
+  if (req.url && req.url.startsWith('/clear-room/')){
+    const roomId = req.url.substring('/clear-room/'.length).split('?')[0];
+    const room = rooms.get(roomId);
+    if (!room){
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Room not found: ' + roomId }));
+      return;
+    }
+    const before = {
+      voxelChanges: (room.voxelChanges || []).length,
+      voxelProps: room.voxelProps.size,
+      props: room.props.size,
+      players: room.players.size,
+    };
+    room.voxelChanges = [];
+    room.voxelProps.clear();
+    room.props.clear();
+    room.ragdolls.clear();
+    room.dummies.clear();
+    stateDirty = true;
+    // Avisar a todos los players que la sala se reseteó
+    broadcastToRoom(roomId, { type: 'roomCleared', message: 'Sala reseteada por admin' });
+    console.log('[v12 manual cleanup] ' + roomId + ': cleared ' + JSON.stringify(before));
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, room: roomId, cleared: before }));
     return;
   }
   res.writeHead(404);
@@ -550,469 +579,4 @@ wss.on('connection', (ws) => {
           };
           room.dummies.set(d.id, d);
           broadcastToRoom(player.room, { type: 'dummySpawn', ...d });
-          break;
-        }
-        case 'dummyDamage': {
-          if (!player.room) break;
-          const room = rooms.get(player.room);
-          if (!room || !room.dummies) break;
-          const d = room.dummies.get(String(msg.id || ''));
-          if (!d) break;
-          const amount = +msg.amount || 0;
-          d.hp = Math.max(0, d.hp - amount);
-          broadcastToRoom(player.room, {
-            type: 'dummyDamage',
-            id: d.id,
-            amount,
-            hp: d.hp,
-            hitTarget: msg.hitTarget,
-            hitDirX: msg.hitDirX,
-            hitDirZ: msg.hitDirZ,
-            fromId: playerId,
-          });
-          break;
-        }
-        case 'dummyDie': {
-          if (!player.room) break;
-          const room = rooms.get(player.room);
-          if (!room || !room.dummies) break;
-          const id = String(msg.id || '');
-          const d = room.dummies.get(id);
-          if (!d) break;
-          room.dummies.delete(id);
-          broadcastToRoom(player.room, {
-            type: 'dummyDie',
-            id,
-            launchVx: msg.launchVx, launchVy: msg.launchVy, launchVz: msg.launchVz,
-          });
-          break;
-        }
-
-        // ============== VOXEL SYNC (igual que v9) ==============
-        case 'voxelChange': {
-          if (!player.room) break;
-          const room = rooms.get(player.room);
-          if (!room) break;
-          if (typeof msg.x !== 'number' || typeof msg.y !== 'number' || typeof msg.z !== 'number') break;
-
-          if (msg.kind === 'remove'){
-            const change = { kind: 'remove', x: msg.x, y: msg.y, z: msg.z };
-            if (msg.mat) change.mat = String(msg.mat).slice(0, 20);
-            pushVoxelChange(room, change);
-            broadcastToRoom(player.room, { type: 'voxelChange', ...change }, playerId);
-          }
-          else if (msg.kind === 'propUpdate' && msg.propId){
-            broadcastToRoom(player.room, {
-              type: 'voxelChange', kind: 'propUpdate',
-              propId: String(msg.propId).slice(0, 64),
-              x: msg.x, y: msg.y, z: msg.z,
-              rx: msg.rx || 0, ry: msg.ry || 0, rz: msg.rz || 0,
-              mat: msg.mat ? String(msg.mat).slice(0, 20) : 'stone',
-            }, playerId);
-          }
-          else if (msg.kind === 'propSettled' && msg.propId){
-            const propId = String(msg.propId).slice(0, 64);
-            const propData = {
-              x: msg.x, y: msg.y, z: msg.z,
-              rx: msg.rx || 0, ry: msg.ry || 0, rz: msg.rz || 0,
-              mat: msg.mat ? String(msg.mat).slice(0, 20) : 'stone',
-            };
-            setProp(room, propId, propData);
-            broadcastToRoom(player.room, {
-              type: 'voxelChange', kind: 'propSettled', propId, ...propData,
-            }, playerId);
-          }
-          else if (msg.kind === 'modelSpawn' && msg.modelId && msg.modelKey){
-            const modelId = String(msg.modelId).slice(0, 64);
-            const modelData = {
-              kind: 'modelSpawn', modelId,
-              modelKey: String(msg.modelKey).slice(0, 64),
-              x: msg.x, y: msg.y, z: msg.z,
-              ry: msg.ry || 0,
-            };
-            pushVoxelChange(room, modelData);
-            broadcastToRoom(player.room, { type: 'voxelChange', ...modelData }, playerId);
-          }
-          else if (msg.kind === 'toxsamSpawn' && msg.modelId && msg.assetUrl){
-            const modelId = String(msg.modelId).slice(0, 64);
-            const data = {
-              kind: 'toxsamSpawn', modelId,
-              assetUrl: String(msg.assetUrl).slice(0, 500),
-              assetName: String(msg.assetName || 'asset').slice(0, 100),
-              x: msg.x, y: msg.y, z: msg.z,
-              ry: msg.ry || 0,
-            };
-            pushVoxelChange(room, data);
-            broadcastToRoom(player.room, { type: 'voxelChange', ...data }, playerId);
-          }
-          break;
-        }
-
-        // ============== MAP SYNC ==============
-        case 'mapLoad': {
-          if (!player.room) break;
-          const room = rooms.get(player.room);
-          if (!room) break;
-          if (msg.url){
-            room.activeMap = {
-              url: String(msg.url).slice(0, 500),
-              name: String(msg.name || 'Map').slice(0, 100),
-              sourceId: msg.sourceId ? String(msg.sourceId).slice(0, 30) : null,
-              scale: typeof msg.scale === 'number' ? msg.scale : null,
-              rotY: typeof msg.rotY === 'number' ? msg.rotY : null,
-              spawnY: typeof msg.spawnY === 'number' ? msg.spawnY : null,
-            };
-          } else {
-            room.activeMap = null;
-          }
-          stateDirty = true;
-          broadcastToRoom(player.room, {
-            type: 'mapLoad',
-            url: msg.url || null,
-            name: msg.name || null,
-            sourceId: msg.sourceId || null,
-            scale: msg.scale,
-            rotY: msg.rotY,
-            spawnY: msg.spawnY,
-          }, playerId);
-          break;
-        }
-        case 'customMapLoad': {
-          if (!player.room) break;
-          const room = rooms.get(player.room);
-          if (!room) break;
-          if (msg.mapId && typeof msg.mapId === 'string'){
-            room.customMapId = msg.mapId.slice(0, 30);
-            stateDirty = true;
-            broadcastToRoom(player.room, { type: 'customMapLoad', mapId: room.customMapId }, playerId);
-          }
-          break;
-        }
-
-        // ============== PROP SYNC (Cannon physics objects) ==============
-        case 'propSpawn': {
-          if (!player.room) break;
-          const room = rooms.get(player.room);
-          if (!room) break;
-          if (!msg.mpId || !msg.kind) break;
-          if (room.props.size >= 200) break;
-          room.props.set(msg.mpId, {
-            kind: String(msg.kind).slice(0, 30),
-            params: msg.params || {},
-            x: +msg.x || 0, y: +msg.y || 0, z: +msg.z || 0,
-            qx: 0, qy: 0, qz: 0, qw: 1,
-            scale: +msg.scale || 1,
-            color: msg.color || null,
-            frozen: false,
-            grabbedBy: null,
-            ownerId: playerId,
-          });
-          broadcastToRoom(player.room, {
-            type: 'propSpawn',
-            mpId: msg.mpId, kind: msg.kind,
-            params: msg.params || {},
-            x: msg.x, y: msg.y, z: msg.z,
-            scale: +msg.scale || 1,
-            color: msg.color || null,
-          }, playerId);
-          break;
-        }
-        case 'propUpdate': {
-          if (!player.room) break;
-          const room = rooms.get(player.room);
-          if (!room || !Array.isArray(msg.props)) break;
-          for (const p of msg.props){
-            // ⭐ v11: AUTO-REGISTER props desconocidos como "externalAsset"
-            // (para GLBs spawneados vía toxsamSpawn que no pasan por propSpawn).
-            let stored = room.props.get(p.id);
-            if (!stored){
-              stored = {
-                kind: 'externalAsset',
-                params: {},
-                x: +p.x || 0, y: +p.y || 0, z: +p.z || 0,
-                qx: +p.qx || 0, qy: +p.qy || 0, qz: +p.qz || 0, qw: +p.qw || 1,
-                scale: 1,
-                color: null,
-                frozen: false,
-                grabbedBy: null,
-                ownerId: playerId,  // First updater = owner
-              };
-              room.props.set(p.id, stored);
-            }
-            // ⭐ v11: SANDBOX MODE — sin ownership check estricto.
-            // Cualquiera puede actualizar la posición (estilo Gmod). El último que escribe gana.
-            stored.x = +p.x; stored.y = +p.y; stored.z = +p.z;
-            stored.qx = +p.qx; stored.qy = +p.qy; stored.qz = +p.qz; stored.qw = +p.qw;
-          }
-          broadcastToRoom(player.room, { type: 'propUpdate', props: msg.props }, playerId);
-          break;
-        }
-        case 'propGrab': {
-          if (!player.room) break;
-          const room = rooms.get(player.room);
-          if (!room || !msg.mpId) break;
-          // ⭐ v11: auto-register si no existe
-          let stored = room.props.get(msg.mpId);
-          if (!stored){
-            stored = {
-              kind: 'externalAsset',
-              params: {},
-              x: 0, y: 0, z: 0, qx: 0, qy: 0, qz: 0, qw: 1,
-              scale: 1, color: null, frozen: false,
-              grabbedBy: null, ownerId: playerId,
-            };
-            room.props.set(msg.mpId, stored);
-          }
-          // ⭐ Si ya está agarrado por otro, robar (sandbox)
-          stored.grabbedBy = playerId;
-          broadcastToRoom(player.room, {
-            type: 'propGrab', mpId: msg.mpId, grabbedBy: playerId,
-          });
-          break;
-        }
-        case 'propRelease': {
-          if (!player.room) break;
-          const room = rooms.get(player.room);
-          if (!room || !msg.mpId) break;
-          let stored = room.props.get(msg.mpId);
-          // ⭐ v11: auto-register si no existe
-          if (!stored){
-            stored = {
-              kind: 'externalAsset',
-              params: {},
-              x: +msg.x || 0, y: +msg.y || 0, z: +msg.z || 0,
-              qx: 0, qy: 0, qz: 0, qw: 1,
-              scale: 1, color: null, frozen: false,
-              grabbedBy: null, ownerId: playerId,
-            };
-            room.props.set(msg.mpId, stored);
-          }
-          stored.grabbedBy = null;
-          if (msg.x !== undefined) stored.x = +msg.x;
-          if (msg.y !== undefined) stored.y = +msg.y;
-          if (msg.z !== undefined) stored.z = +msg.z;
-          broadcastToRoom(player.room, {
-            type: 'propRelease', mpId: msg.mpId,
-            x: msg.x, y: msg.y, z: msg.z,
-            vx: msg.vx || 0, vy: msg.vy || 0, vz: msg.vz || 0,
-          });
-          break;
-        }
-        case 'propScale': {
-          if (!player.room) break;
-          const room = rooms.get(player.room);
-          if (!room || !msg.mpId) break;
-          // ⭐ v11: auto-register si no existe
-          let stored = room.props.get(msg.mpId);
-          if (!stored){
-            stored = {
-              kind: 'externalAsset',
-              params: {},
-              x: 0, y: 0, z: 0, qx: 0, qy: 0, qz: 0, qw: 1,
-              scale: 1, color: null, frozen: false,
-              grabbedBy: null, ownerId: playerId,
-            };
-            room.props.set(msg.mpId, stored);
-          }
-          // ⭐ v11: SANDBOX — sin ownership check, cualquiera puede escalar
-          stored.scale = Math.max(0.1, Math.min(10, +msg.scale || 1));
-          broadcastToRoom(player.room, { type: 'propScale', mpId: msg.mpId, scale: stored.scale });
-          break;
-        }
-        case 'propFreeze': {
-          if (!player.room) break;
-          const room = rooms.get(player.room);
-          if (!room || !msg.mpId) break;
-          let stored = room.props.get(msg.mpId);
-          if (!stored){
-            stored = {
-              kind: 'externalAsset',
-              params: {},
-              x: 0, y: 0, z: 0, qx: 0, qy: 0, qz: 0, qw: 1,
-              scale: 1, color: null, frozen: false,
-              grabbedBy: null, ownerId: playerId,
-            };
-            room.props.set(msg.mpId, stored);
-          }
-          // ⭐ v11: SANDBOX — cualquiera puede freeze/unfreeze
-          stored.frozen = !!msg.frozen;
-          if (stored.frozen) stored.grabbedBy = null;
-          broadcastToRoom(player.room, {
-            type: 'propFreeze', mpId: msg.mpId, frozen: stored.frozen,
-            x: stored.x, y: stored.y, z: stored.z,
-            qx: stored.qx, qy: stored.qy, qz: stored.qz, qw: stored.qw,
-          });
-          break;
-        }
-        case 'propRemove': {
-          if (!player.room) break;
-          const room = rooms.get(player.room);
-          if (!room || !msg.mpId) break;
-          const stored = room.props.get(msg.mpId);
-          if (stored && stored.ownerId === playerId){
-            room.props.delete(msg.mpId);
-            broadcastToRoom(player.room, { type: 'propRemove', mpId: msg.mpId }, playerId);
-          }
-          break;
-        }
-
-        // ============== RAGDOLL SYNC ==============
-        case 'ragdollActivate': {
-          if (!player.room) break;
-          const room = rooms.get(player.room);
-          if (!room || !msg.mpId) break;
-          if (room.ragdolls.size >= 50) break;
-          room.ragdolls.set(msg.mpId, {
-            mpId: msg.mpId,
-            propMpId: msg.propMpId || null,
-            sourceId: msg.sourceId ? String(msg.sourceId).slice(0, 30) : null,
-            modelKey: msg.modelKey ? String(msg.modelKey).slice(0, 100) : null,
-            externalAsset: msg.externalAsset || null,
-            bonesTags: Array.isArray(msg.bonesTags) ? msg.bonesTags.slice(0, 12) : [],
-            bones: [],
-            ownerId: playerId,
-          });
-          broadcastToRoom(player.room, {
-            type: 'ragdollActivate',
-            mpId: msg.mpId,
-            propMpId: msg.propMpId,
-            sourceId: msg.sourceId,
-            modelKey: msg.modelKey,
-            externalAsset: msg.externalAsset,
-            bonesTags: msg.bonesTags,
-          }, playerId);
-          break;
-        }
-        case 'ragdollUpdate': {
-          if (!player.room) break;
-          const room = rooms.get(player.room);
-          if (!room || !Array.isArray(msg.ragdolls)) break;
-          for (const r of msg.ragdolls){
-            const stored = room.ragdolls.get(r.id);
-            if (stored && stored.ownerId === playerId && Array.isArray(r.bones)){
-              stored.bones = r.bones;
-            }
-          }
-          broadcastToRoom(player.room, { type: 'ragdollUpdate', ragdolls: msg.ragdolls }, playerId);
-          break;
-        }
-
-        // ============== HEARTBEAT ==============
-        case 'ping': sendTo(playerId, { type: 'pong', t: msg.t, st: Date.now() }); break;
-
-        default:
-          // Mensaje desconocido — ignorar silenciosamente
-          break;
-      }
-    } catch(e){
-      console.warn('[err] Handler error for type=' + msg.type + ': ' + e.message);
-    }
-  });
-
-  ws.on('close', () => {
-    console.log('[-] ' + playerId + ' disconnected');
-    if (player.room){
-      const room = rooms.get(player.room);
-      if (room){
-        room.players.delete(playerId);
-        broadcastToRoom(player.room, { type: 'leave', id: playerId });
-        if (room.props){
-          for (const [mpId, p] of room.props){
-            if (p.grabbedBy === playerId){
-              p.grabbedBy = null;
-              broadcastToRoom(player.room, {
-                type: 'propRelease', mpId,
-                x: p.x, y: p.y, z: p.z, vx:0, vy:0, vz:0,
-              });
-            }
-          }
-        }
-        if (room.ragdolls){
-          for (const [mpId, r] of room.ragdolls){
-            if (r.ownerId === playerId){
-              room.ragdolls.delete(mpId);
-            }
-          }
-        }
-        // ⭐ v10: limpiar dummies del jugador desconectado
-        if (room.dummies){
-          for (const [id, d] of room.dummies){
-            if (d.ownerId === playerId){
-              room.dummies.delete(id);
-              broadcastToRoom(player.room, { type: 'dummyDie', id });
-            }
-          }
-        }
-      }
-    }
-    players.delete(playerId);
-  });
-
-  ws.on('error', () => { try { ws.close(); } catch(e){} });
-});
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [pid, p] of players){
-    if (now - p.lastSeen > 60_000){
-      console.log('[clean] Dropping stale ' + pid);
-      try { p.ws.close(); } catch(e){}
-    }
-  }
-}, 30_000);
-
-function restartGracefully(reason){
-  console.log('[restart] ' + reason);
-  saveState();
-  for (const [pid, p] of players){
-    try {
-      p.ws.send(JSON.stringify({ type: 'serverRestart', reason }));
-      p.ws.close();
-    } catch(e){}
-  }
-  setTimeout(() => process.exit(0), 1000);
-}
-
-setTimeout(() => restartGracefully('Scheduled 90-min restart'), RESTART_INTERVAL_MS);
-
-setInterval(() => {
-  const memMB = process.memoryUsage().heapUsed / 1024 / 1024;
-  if (memMB > RAM_LIMIT_MB){
-    restartGracefully('RAM overload: ' + memMB.toFixed(0) + 'MB');
-  }
-}, 10_000);
-
-let lastLagCheck = Date.now();
-setInterval(() => {
-  const now = Date.now();
-  const lag = (now - lastLagCheck) - 1000;
-  if (lag > EVENT_LOOP_LAG_LIMIT_MS){
-    restartGracefully('Event loop lag: ' + lag + 'ms');
-    return;
-  }
-  lastLagCheck = now;
-}, 1000);
-
-process.on('SIGTERM', () => {
-  console.log('[sig] SIGTERM');
-  saveState();
-  process.exit(0);
-});
-
-server.listen(PORT, () => {
-  console.log('================================');
-  console.log('JJK Sandbox Server v11');
-  console.log('Mode: SANDBOX (Garry\'s Mod style)');
-  console.log('Listening on :' + PORT);
-  console.log('Health: /health');
-  console.log('Rooms:  /rooms');
-  console.log('Auto-restart: ' + (RESTART_INTERVAL_MS / 60000) + ' min');
-  console.log('NEW IN v10:');
-  console.log('  - pose as object (real animations sync)');
-  console.log('  - emote, dummy handlers');
-  console.log('  - roomState compat: players + others');
-  console.log('  - playerName/color in joinRoom (no setName needed)');
-  console.log('  - skinId persistence');
-  console.log('REMOVED (PvP leftovers): attack, remate, playerDamage, playerDie, playerRespawn, propHit');
-  console.log('================================');
-});
+          break
