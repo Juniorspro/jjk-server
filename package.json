@@ -1,15 +1,17 @@
 {
-  "name": "jjk-24frames-multiplayer",
+  "name": "jjk-server",
   "version": "1.0.0",
-  "description": "Multiplayer WebSocket server for JJK 24Frames game",
+  "description": "JJK 24Frames Sandbox Multiplayer Server v13 (server-authoritative physics)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
-  "dependencies": {
-    "ws": "^8.18.0"
-  },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "cannon-es": "^0.20.0"
   }
 }
+
